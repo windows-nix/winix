@@ -1,0 +1,294 @@
+#!/usr/bin/env nix
+#! nix shell nixpkgs#python3 nixpkgs#git nixpkgs#yq-go --command python3
+"""Regenerate pins.json from a Nix package list or common/bareOnly/vmOnly sets.
+
+Paths are setup-independent: --config/--output, WINDOWS_PACKAGES/WINDOWS_PINS,
+or WINDOWS_CONFIG_DIR (which changes both defaults) select the host files.
+
+winget ids come from microsoft/winget-pkgs at WINGET_COMMIT (blobless clone in
+$WINGET_PKGS, default /tmp/wp, cloned if missing). github and url sources are
+resolved live; files without a published digest are added to the Nix store with
+`nix store prefetch-file`, so the later `nix build` does not download them again.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+WINGET_COMMIT = "794a1a43c1639bd44ddf30c882ed5e66a189242e"
+WP = Path(os.environ.get("WINGET_PKGS", "/tmp/wp"))
+
+DEFAULT_SILENT = {
+    "nullsoft": "/S",
+    "inno": "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-",
+    "msi": "/qn /norestart",
+    "wix": "/qn",
+    "burn": "/quiet /norestart",
+}
+# Installer types acceptable for each package kind.
+KIND_TYPES = {
+    "installer": {"exe", "inno", "nullsoft", "burn"},
+    "msi": {"msi", "wix"},
+    "msix": {"msix", "appx"},
+    "zip": {"zip"},
+    "driver": {"zip", "exe"},
+}
+ARCH_PREF = ["x64", "neutral", "x86"]
+
+
+def run(*cmd, **kw):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw).stdout
+
+
+def ensure_winget():
+    if not (WP / ".git").exists():
+        run("git", "clone", "--filter=blob:none", "--no-checkout",
+            "https://github.com/microsoft/winget-pkgs", str(WP))
+    try:
+        run("git", "-C", str(WP), "cat-file", "-e", WINGET_COMMIT + "^{commit}")
+    except subprocess.CalledProcessError:
+        run("git", "-C", str(WP), "fetch", "--filter=blob:none", "origin", WINGET_COMMIT)
+
+
+def version_key(v):
+    return [(1, int(p)) if p.isdigit() else (0, p.lower()) for p in re.findall(r"\d+|[A-Za-z]+", v)]
+
+
+def winget_manifest(pkg_id):
+    parts = pkg_id.split(".")
+    base = "manifests/{}/{}".format(pkg_id[0].lower(), "/".join(parts))
+    names = run("git", "-C", str(WP), "ls-tree", "--name-only", WINGET_COMMIT, base + "/").split()
+    # A version dir holds <id>.installer.yaml; sibling packages (Preview,
+    # Insiders, ...) only hold more dirs, so the existence check skips them.
+    versions = [n.rsplit("/", 1)[1] for n in names]
+    versions = [v for v in versions
+                if subprocess.run(["git", "-C", str(WP), "cat-file", "-e",
+                                   f"{WINGET_COMMIT}:{base}/{v}/{pkg_id}.installer.yaml"],
+                                  capture_output=True).returncode == 0]
+    if not versions:
+        sys.exit(f"winget: no versions for {pkg_id} at {WINGET_COMMIT}")
+    for v in sorted(versions, key=version_key, reverse=True):
+        text = run("git", "-C", str(WP), "show", f"{WINGET_COMMIT}:{base}/{v}/{pkg_id}.installer.yaml")
+        yield json.loads(run("yq", "-o=json", ".", input=text))
+
+
+def pick_installer(m, kind, pkg_id):
+    root = {k: v for k, v in m.items() if k != "Installers"}
+    cands = []
+    for ins in m["Installers"]:
+        full = {**root, **ins}
+        full["InstallerSwitches"] = {**root.get("InstallerSwitches", {}), **ins.get("InstallerSwitches", {})}
+        t = full.get("InstallerType", "").lower()
+        if t in KIND_TYPES[kind] and full.get("Architecture") in ARCH_PREF:
+            cands.append(full)
+    if not cands:
+        return None
+    cands.sort(key=lambda i: (ARCH_PREF.index(i["Architecture"]),
+                              0 if i.get("Scope", "machine") == "machine" else 1))
+    return cands[0]
+
+
+def file_name(url, ext):
+    u = urllib.parse.urlparse(url)
+    q = urllib.parse.parse_qs(u.query)
+    segs = [s for s in u.path.split("/") if s]
+    name = segs[-1] if segs else "download"
+    if "path" in q:
+        name = q["path"][0].rsplit("/", 1)[-1]
+    elif name == "download" and len(segs) > 1:  # sourceforge .../File.exe/download
+        name = segs[-2]
+    if "launcherfilename" in q:
+        name = q["launcherfilename"][0]
+    name = re.sub(r"[^A-Za-z0-9+._=-]", "_", urllib.parse.unquote(name))
+    if "." not in name:
+        name += ext
+    return name
+
+
+def prefetch(url, name):
+    for attempt in range(3):  # large downloads from slow mirrors fail transiently
+        try:
+            out = json.loads(run("nix", "store", "prefetch-file", "--json", "--hash-type", "sha256",
+                                 "--name", name, url))
+            break
+        except subprocess.CalledProcessError as e:
+            if attempt == 2:
+                sys.exit(f"prefetch {url}: {e.stderr}")
+    return run("nix", "hash", "convert", "--hash-algo", "sha256", "--to", "base16", out["hash"]).strip()
+
+
+def gh_get(path):
+    req = urllib.request.Request("https://api.github.com/" + path,
+                                 headers={"Accept": "application/vnd.github+json"})
+    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if tok:
+        req.add_header("Authorization", "Bearer " + tok)
+    with urllib.request.urlopen(req) as r:
+        return json.load(r)
+
+
+def github_pin(repo, asset_re):
+    rx = re.compile(asset_re)
+    releases = [gh_get(f"repos/{repo}/releases/latest")]
+    releases += [r for r in gh_get(f"repos/{repo}/releases?per_page=50") if not r["draft"]]
+    for rel in releases:
+        if rel.get("prerelease") and rel is not releases[0]:
+            continue
+        for a in rel["assets"]:
+            if rx.search(a["name"]):
+                digest = a.get("digest") or ""
+                sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else \
+                    prefetch(a["browser_download_url"], a["name"])
+                return {"version": rel["tag_name"].lstrip("vV"), "url": a["browser_download_url"],
+                        "sha256": sha, "file": a["name"], "installerType": None}
+    sys.exit(f"github: no release asset of {repo} matches {asset_re}")
+
+
+EXT = {"zip": ".zip", "msi": ".msi", "msix": ".msixbundle"}
+
+
+def resolve(item):
+    src = item["source"]
+    requested_kind = item.get("kind", "auto")
+    kind = requested_kind
+    if "winget" in src:
+        # Newest version that still ships a usable installer (AmneziaVPN's
+        # latest is portable-only).
+        for m in winget_manifest(src["winget"]):
+            if requested_kind == "auto":
+                for candidate in ("installer", "msi", "msix", "zip"):
+                    ins = pick_installer(m, candidate, src["winget"])
+                    if candidate == "zip" and ins and not ins.get("NestedInstallerType"):
+                        ins = None
+                    if ins:
+                        kind = candidate
+                        break
+            else:
+                ins = pick_installer(m, kind, src["winget"])
+            if ins:
+                break
+        else:
+            sys.exit(f"winget: {src['winget']} has no {kind} installer for {ARCH_PREF}")
+        t = ins["InstallerType"].lower()
+        sw = ins.get("InstallerSwitches", {})
+        silent = sw.get("Silent") or DEFAULT_SILENT.get(t)
+        if silent and sw.get("Custom"):
+            silent += " " + sw["Custom"]
+        arp = ins.get("AppsAndFeaturesEntries") or [{}]
+        # fetchurl's curl globs [] (Guru3D file names).
+        url = ins["InstallerUrl"].replace("[", "%5B").replace("]", "%5D")
+        pin = {"version": str(arp[0].get("DisplayVersion") or m["PackageVersion"]),
+               "url": url, "sha256": ins["InstallerSha256"].lower(),
+               "file": file_name(ins["InstallerUrl"], EXT.get(kind, ".exe")),
+               "silentArgs": silent, "installerType": t}
+        if requested_kind == "auto":
+            pin["kind"] = kind
+        display_name = arp[0].get("DisplayName")
+        if not item.get("detect"):
+            if display_name:
+                pin["detect"] = {"displayName": "^" + re.escape(display_name) + "$"}
+            elif ins.get("ProductCode"):
+                pin["detect"] = {"productCode": ins["ProductCode"]}
+            elif kind == "msix" and ins.get("PackageFamilyName"):
+                pin["detect"] = {"appx": ins["PackageFamilyName"].split("_", 1)[0]}
+        if t == "zip" and ins.get("NestedInstallerType"):
+            pin["installerType"] = ins["NestedInstallerType"].lower()
+            nested = ins.get("NestedInstallerFiles") or [{}]
+            pin["nestedFile"] = nested[0].get("RelativeFilePath")
+            if not item.get("silentArgs"):
+                pin["silentArgs"] = sw.get("Silent") or DEFAULT_SILENT.get(pin["installerType"])
+        return pin
+    if kind == "auto":
+        sys.exit(f"{item['id']}: kind = auto requires a winget source")
+    if "github" in src:
+        pin = github_pin(src["github"]["repo"], src["github"]["asset"])
+    else:
+        name = file_name(src["url"], EXT.get(kind, ".exe"))
+        pin = {"version": src["version"], "url": src["url"], "sha256": prefetch(src["url"], name),
+               "file": name, "installerType": None}
+    pin["silentArgs"] = None
+    return pin
+
+
+def normalize_item(item):
+    if isinstance(item, str):
+        return {
+            "id": re.sub(r"[^a-z0-9]", "-", item.lower()),
+            "name": item,
+            "kind": "auto",
+            "source": {"winget": item},
+            "silentArgs": None,
+            "detect": None,
+        }
+    return item
+
+
+def flatten_items(data):
+    if isinstance(data, list):
+        return [normalize_item(item) for item in data]
+    if not isinstance(data, dict):
+        raise SystemExit("package file must evaluate to a list or common/bareOnly/vmOnly sets")
+    unknown = set(data) - {"common", "bareOnly", "vmOnly"}
+    if unknown:
+        raise SystemExit(f"unknown package set(s): {', '.join(sorted(unknown))}")
+    items = []
+    for group in ("common", "bareOnly", "vmOnly"):
+        value = data.get(group, [])
+        if not isinstance(value, list):
+            raise SystemExit(f"packages.{group} must be a list")
+        items.extend(normalize_item(item) for item in value)
+    return items
+
+
+def refreshed_pins(items, existing, only, resolver=resolve):
+    ids = [item["id"] for item in items]
+    if len(ids) != len(set(ids)):
+        raise SystemExit("duplicate package ids in package file")
+    unknown = only - set(ids)
+    if unknown:
+        raise SystemExit(f"unknown selected package id(s): {', '.join(sorted(unknown))}")
+    pins = dict(existing) if only else {}
+    for item in items:
+        if only and item["id"] not in only:
+            continue
+        print(f"resolving {item['id']}", file=sys.stderr)
+        pin = resolver(item)
+        if item.get("silentArgs") is not None:
+            pin["silentArgs"] = item["silentArgs"]
+        pins[item["id"]] = pin
+    return pins
+
+
+def main():
+    config_dir = Path(os.environ.get("WINDOWS_CONFIG_DIR", ".")).resolve()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("ids", nargs="*", help="refresh only these package IDs")
+    parser.add_argument("--config", type=Path,
+                        default=Path(os.environ.get("WINDOWS_PACKAGES", config_dir / "packages.nix")),
+                        help="Nix package file (default: ./packages.nix)")
+    parser.add_argument("--output", type=Path,
+                        default=Path(os.environ.get("WINDOWS_PINS", config_dir / "pins.json")),
+                        help="pin JSON output (default: ./pins.json)")
+    args = parser.parse_args()
+    package_file = args.config.resolve()
+    output = args.output.resolve()
+    items = flatten_items(json.loads(run("nix", "eval", "--json", "--file", str(package_file))))
+    only = set(args.ids)
+    selected = [item for item in items if not only or item["id"] in only]
+    if any("winget" in item["source"] for item in selected):
+        ensure_winget()
+    existing = json.loads(output.read_text()) if only and output.exists() else {}
+    pins = refreshed_pins(items, existing, only, resolver=resolve)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_text(json.dumps(pins, indent=2, sort_keys=True) + "\n")
+    temporary.replace(output)
+
+
+if __name__ == "__main__":
+    main()
